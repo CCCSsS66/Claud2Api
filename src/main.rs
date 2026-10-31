@@ -1,0 +1,178 @@
+use claud2api::{
+    config::Config,
+    control,
+    engine::Engine,
+    updates::{self},
+    web,
+};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+fn main() {
+    if std::env::args().any(|a| a == "--describe-build") {
+        println!("{}", updates::describe());
+        return;
+    }
+    if std::env::args().any(|a| a == "--healthcheck") {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let port = std::env::var("PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(8080);
+        let result = (|| -> std::io::Result<bool> {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let mut socket = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.write_all(
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut status = String::new();
+            BufReader::new(socket.take(256)).read_line(&mut status)?;
+            Ok(status.starts_with("HTTP/1.1 200 "))
+        })();
+        std::process::exit(if matches!(result, Ok(true)) { 0 } else { 1 });
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 4))
+                .unwrap_or(2),
+        )
+        .enable_all()
+        .build()
+        .expect("runtime initialization");
+    if let Err(error) = runtime.block_on(run()) {
+        eprintln!(
+            "startup_failed status={} code={} message={}",
+            error.status, error.kind, error.message
+        );
+        std::process::exit(1);
+    }
+}
+async fn run() -> claud2api::error::Result<()> {
+    let config = Config::load()?;
+    claud2api::control::set_secure_transport(config.secure_transport());
+    if !updates::managed() && cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let stop = CancellationToken::new();
+        let signal_stop = stop.clone();
+        let signals = tokio::spawn(async move {
+            signal().await;
+            signal_stop.cancel();
+        });
+        let result = updates::run(config, stop).await;
+        signals.abort();
+        return result;
+    }
+    run_worker(config).await
+}
+async fn run_worker(config: Config) -> claud2api::error::Result<()> {
+    let engine = Engine::open(config.clone()).await?;
+    if updates::managed() {
+        let stop = engine.shutdown.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut byte = [0; 1];
+            while matches!(std::io::stdin().read(&mut byte), Ok(1)) {}
+            stop.cancel();
+        });
+    }
+    let public = tokio::net::TcpListener::bind(config.public_bind)
+        .await
+        .map_err(|_| {
+            claud2api::error::Fault::new(503, "api_error", "cannot bind public listener")
+        })?;
+    let private = tokio::net::TcpListener::bind(config.control_bind)
+        .await
+        .map_err(|_| {
+            claud2api::error::Fault::new(503, "api_error", "cannot bind control listener")
+        })?;
+    updates::ready(
+        public
+            .local_addr()
+            .map_err(|_| claud2api::error::Fault::internal())?,
+        private
+            .local_addr()
+            .map_err(|_| claud2api::error::Fault::internal())?,
+    )?;
+    let worker_stop = engine.shutdown.clone();
+    let shutdown = CancellationToken::new();
+    let janitor_stop = shutdown.clone();
+    let janitor_engine = engine.clone();
+    let janitor = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {_=janitor_stop.cancelled()=>break,_=timer.tick()=>{if janitor_engine.sweep().await.is_err(){eprintln!("background_failed code=state_or_cleanup");}}}
+        }
+    });
+    eprintln!(
+        "Claud2Api {} ready public={} control={}",
+        claud2api::VERSION,
+        config.public_bind,
+        config.control_bind
+    );
+    let public_handle = axum_server::Handle::new();
+    let private_handle = axum_server::Handle::new();
+    // The managed worker always speaks plain HTTP on loopback; the supervisor
+    // terminates TLS for the public listeners.
+    let (public_tls, control_tls) = if updates::managed() {
+        (None, None)
+    } else {
+        (
+            updates::tls_config(config.public_tls.as_ref()).await?,
+            updates::tls_config(config.control_tls.as_ref()).await?,
+        )
+    };
+    let private_engine = engine.clone();
+    let status_store = engine.store.clone();
+    let mut public = updates::spawn_server(
+        public,
+        public_tls,
+        web::public(engine),
+        public_handle.clone(),
+    )?;
+    let mut private = updates::spawn_server(
+        private,
+        control_tls,
+        control::router(private_engine),
+        private_handle.clone(),
+    )?;
+    let completed = tokio::select! {_=signal()=>0,_=worker_stop.cancelled()=>0,_=&mut public=>1,_=&mut private=>2};
+    worker_stop.cancel();
+    shutdown.cancel();
+    public_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+    private_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+    if completed != 1
+        && tokio::time::timeout(Duration::from_secs(5), &mut public)
+            .await
+            .is_err()
+    {
+        public.abort();
+    }
+    if completed != 2
+        && tokio::time::timeout(Duration::from_secs(5), &mut private)
+            .await
+            .is_err()
+    {
+        private.abort();
+    }
+    if tokio::time::timeout(Duration::from_secs(5), janitor)
+        .await
+        .is_err()
+    {
+        eprintln!("shutdown code=cleanup_deferred");
+    }
+    let _ = status_store.flush_status().await;
+    Ok(())
+}
+async fn signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}

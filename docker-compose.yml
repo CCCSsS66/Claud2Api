@@ -1,0 +1,59 @@
+# Public deployment: both listeners bind all interfaces.
+# TLS is enforced by the application unless TRUST_PROXY=true terminates it upstream.
+services:
+  claud2api:
+    build: .
+    image: "${CLAUD2API_IMAGE:-ghcr.io/saito-sakuya/claud2api:0.1.0-alpha.7}"
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    user: "${CLAUD2API_UID:-65532}:${CLAUD2API_GID:-65532}"
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1
+    stop_grace_period: 35s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    secrets: [gateway_key, admin_key, accounts, control_tls_cert, control_tls_key]
+    volumes:
+      - "${CLAUD2API_STATE_DIR:?Set a protected state directory}:/var/lib/claud2api"
+    environment:
+      BIND_HOST: "${BIND_HOST:-0.0.0.0}"
+      PORT: "${GATEWAY_PORT:-18081}"
+      CONTROL_BIND: "${CONTROL_BIND:-0.0.0.0:18082}"
+      ALLOW_REMOTE_CONTROL: "${ALLOW_REMOTE_CONTROL:-true}"
+      TRUST_PROXY: "${TRUST_PROXY:-false}"
+      ALLOW_INSECURE_CONTROL: "${ALLOW_INSECURE_CONTROL:-false}"
+      ADMIN_ALLOW_CIDRS: "${ADMIN_ALLOW_CIDRS:-}"
+      ADMIN_SESSION_TTL_SECONDS: "${ADMIN_SESSION_TTL_SECONDS:-28800}"
+      ADMIN_MAX_FAILED_ATTEMPTS: "${ADMIN_MAX_FAILED_ATTEMPTS:-10}"
+      ADMIN_LOCKOUT_SECONDS: "${ADMIN_LOCKOUT_SECONDS:-900}"
+      CONTROL_TLS_CERT_FILE: /run/secrets/control_tls_cert
+      CONTROL_TLS_KEY_FILE: /run/secrets/control_tls_key
+      CLAUD2API_DATA_DIR: /var/lib/claud2api
+      GATEWAY_API_KEY_FILE: /run/secrets/gateway_key
+      ADMIN_API_KEY_FILE: /run/secrets/admin_key
+      CLAUDE_ACCOUNTS_FILE: /run/secrets/accounts
+      SIMULATED_CACHE_ENABLED: "${SIMULATED_CACHE_ENABLED:-true}"
+      CLAUDE_TIMEZONE: "${CLAUDE_TIMEZONE:-Asia/Taipei}"
+      CLAUDE_LOCALE: "${CLAUDE_LOCALE:-zh-CN}"
+      CLAUD2API_UPDATE_REPOSITORY: "${CLAUD2API_UPDATE_REPOSITORY:-Saito-Sakuya/Claud2Api}"
+      CLAUD2API_UPDATE_DISABLED: "${CLAUD2API_UPDATE_DISABLED:-false}"
+secrets:
+  gateway_key:
+    file: "${GATEWAY_API_KEY_FILE:?Set a protected gateway key file}"
+  admin_key:
+    file: "${ADMIN_API_KEY_FILE:?Set a different protected admin key file}"
+  accounts:
+    file: "${CLAUDE_ACCOUNTS_FILE:?Set a protected accounts file}"
+  control_tls_cert:
+    file: "${CONTROL_TLS_CERT_FILE:?Set the console TLS certificate (PEM) file}"
+  control_tls_key:
+    file: "${CONTROL_TLS_KEY_FILE:?Set the matching console TLS private key (PEM) file}"
