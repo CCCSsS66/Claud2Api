@@ -1664,3 +1664,115 @@ async function reloadPanel() {
 }
 window.Claud2ApiUI = {request:api,refresh,connect,reload:reloadPanel,hasDraft,table,loggedIn:()=>Boolean(key)};
 })();
+
+let playgroundHistory = [];
+let playgroundModelsLoaded = false;
+async function loadPlaygroundModels() {
+  if (playgroundModelsLoaded) return;
+  playgroundModelsLoaded = true;
+  try {
+    const data = await api("/models");
+    const models = data.models?.enabled
+      ? (data.models.entries || []).filter((entry) => entry.enabled)
+      : (data.default_models || []);
+    const list = $("playground-models");
+    list.textContent = "";
+    for (const entry of models) {
+      const option = document.createElement("option");
+      option.value = entry.id || entry.upstream_model || "";
+      option.label = entry.display_name || option.value;
+      list.append(option);
+    }
+  } catch {}
+}
+document.querySelectorAll('[data-tab="playground"]').forEach((button) =>
+  button.addEventListener("click", loadPlaygroundModels)
+);
+$("playground-clear").addEventListener("click", () => {
+  playgroundHistory = [];
+  $("playground-output").textContent = "";
+});
+$("playground-send").addEventListener("click", async () => {
+  const button = $("playground-send");
+  if (button.disabled) return;
+  const text = $("playground-input").value.trim();
+  if (!text) return;
+  const model = $("playground-model").value.trim();
+  const system = $("playground-system").value.trim();
+  const stream = $("playground-stream").checked;
+  const output = $("playground-output");
+  button.disabled = true;
+  output.textContent = "";
+  playgroundHistory.push({ role: "user", content: text });
+  const body = {
+    model,
+    max_tokens: 2048,
+    stream,
+    messages: playgroundHistory,
+  };
+  if (system) body.system = system;
+  try {
+    const response = await fetch("/control/v1/playground", {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        Authorization: "Bearer " + key,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      output.textContent = error.error?.message || error.message || "请求失败";
+      playgroundHistory.pop();
+      return;
+    }
+    if (stream) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let answer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let index;
+        while ((index = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, index);
+          buffer = buffer.slice(index + 2);
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload || payload === "[DONE]") continue;
+            try {
+              const event = JSON.parse(payload);
+              if (
+                event.type === "content_block_delta" &&
+                event.delta?.type === "text_delta"
+              ) {
+                answer += event.delta.text;
+                output.textContent = answer;
+                output.scrollTop = output.scrollHeight;
+              }
+            } catch {}
+          }
+        }
+      }
+      playgroundHistory.push({ role: "assistant", content: answer });
+    } else {
+      const data = await response.json();
+      const answer = (data.content || [])
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("");
+      output.textContent = answer;
+      playgroundHistory.push({ role: "assistant", content: answer });
+    }
+    $("playground-input").value = "";
+  } catch (error) {
+    output.textContent = error.message || "请求失败";
+    playgroundHistory.pop();
+  } finally {
+    button.disabled = false;
+  }
+});

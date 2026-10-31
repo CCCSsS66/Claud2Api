@@ -736,3 +736,27 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outlin
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+.playground-panel { display: grid; gap: 16px; }
+.playground-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: end; }
+.playground-controls label { flex: 1 1 220px; }
+.playground-stream { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.playground-actions { display: flex; gap: 10px; }
+.playground-output {
+  min-height: 180px;
+  max-height: 55vh;
+  overflow: auto;
+  margin: 0;
+  padding: 16px;
+  border-radius: 12px;
+  border: 1px solid var(--line, rgba(0,0,0,.12));
+  background: var(--surface-sunken, rgba(0,0,0,.03));
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: .92rem;
+  line-height: 1.6;
+}
+@media (max-width: 560px) {
+  .playground-controls { flex-direction: column; align-items: stretch; }
+}

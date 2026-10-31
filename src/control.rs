@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{HeaderValue, Method},
     middleware::{self, Next},
@@ -309,6 +309,7 @@ pub fn router(e: Arc<Engine>) -> Router {
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", delete(clear))
         .route("/settings", get(settings).put(update_settings))
+        .route("/playground", post(playground))
         .route("/updates", get(standalone_updates))
         .route("/_runtime/export", post(runtime_export))
         .route("/_runtime/import", post(runtime_import))
@@ -1361,4 +1362,37 @@ async fn delete_token(
         })
         .await?;
     Ok(Json(value))
+}
+
+async fn playground(State(e): State<Arc<Engine>>, Json(body): Json<Value>) -> Result<Response> {
+    let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
+    if messages
+        .as_array()
+        .is_none_or(|messages| messages.is_empty())
+    {
+        return Err(Fault::invalid("messages must be a nonempty array"));
+    }
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let mut payload = json!({
+        "model": model,
+        "max_tokens": body.get("max_tokens").cloned().unwrap_or(json!(2048)),
+        "stream": stream,
+        "messages": messages,
+    });
+    if let Some(system) = body.get("system").filter(|value| !value.is_null()) {
+        payload["system"] = system.clone();
+    }
+    let request = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-api-key", e.config.gateway_key.as_str())
+        .body(Body::from(payload.to_string()))
+        .map_err(|_| Fault::internal())?;
+    use tower::ServiceExt;
+    crate::web::public(e)
+        .oneshot(request)
+        .await
+        .map_err(|_| Fault::internal())
 }

@@ -42,6 +42,10 @@ struct Projection {
     conversation_id: Option<String>,
     native_tools: Option<Value>,
     project_uuid: Option<String>,
+    tools: Vec<protocol::Tool>,
+    choice: protocol::Choice,
+    tool_nonce: String,
+    uploads: Vec<crate::media::Upload>,
     prompt: String,
 }
 
@@ -54,7 +58,8 @@ impl Projection {
             validate_conversation_id(optional_string(object, "conversation_id")?)?;
         let native_tools = object.get("claud2api_tools").cloned();
         let project_uuid = crate::native_tools::project(raw)?;
-        reject_tools(object)?;
+        let (tools, choice) = tool_definitions(object)?;
+        let tool_nonce = nonce();
         let include_usage = match object.get("stream_options") {
             None => false,
             Some(options) => {
@@ -69,6 +74,8 @@ impl Projection {
             .and_then(Value::as_array)
             .filter(|messages| !messages.is_empty())
             .ok_or_else(|| Fault::invalid("messages must be a nonempty array"))?;
+        let mut sources = crate::media::Sources::default();
+        let mut references = Vec::new();
         let mut messages = Vec::with_capacity(raw_messages.len());
         for (index, raw_message) in raw_messages.iter().enumerate() {
             let message = raw_message
@@ -77,27 +84,114 @@ impl Projection {
             let role = message
                 .get("role")
                 .and_then(Value::as_str)
-                .filter(|role| matches!(*role, "system" | "developer" | "user" | "assistant"))
+                .filter(|role| {
+                    matches!(
+                        *role,
+                        "system" | "developer" | "user" | "assistant" | "tool"
+                    )
+                })
                 .ok_or_else(|| {
                     Fault::invalid(format!(
-                        "messages[{index}].role must be system, developer, user, or assistant"
+                        "messages[{index}].role must be system, developer, user, assistant, or tool"
                     ))
                 })?;
-            if ["tool_calls", "function_call", "tool_call_id"]
+            if role == "tool" {
+                let call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        Fault::invalid(format!("messages[{index}].tool_call_id is required"))
+                    })?;
+                let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }));
+                continue;
+            }
+            if let Some(calls) = message.get("tool_calls") {
+                if role != "assistant" {
+                    return Err(Fault::invalid(format!(
+                        "messages[{index}].tool_calls requires the assistant role"
+                    )));
+                }
+                let calls = calls
+                    .as_array()
+                    .filter(|calls| !calls.is_empty())
+                    .ok_or_else(|| {
+                        Fault::invalid(format!(
+                            "messages[{index}].tool_calls must be a nonempty array"
+                        ))
+                    })?;
+                let mut projected_calls = Vec::with_capacity(calls.len());
+                for (call_index, call) in calls.iter().enumerate() {
+                    let id = call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            Fault::invalid(format!(
+                                "messages[{index}].tool_calls[{call_index}].id is required"
+                            ))
+                        })?;
+                    let function = call.get("function").and_then(Value::as_object).ok_or_else(
+                        || {
+                            Fault::invalid(format!(
+                                "messages[{index}].tool_calls[{call_index}].function is required"
+                            ))
+                        },
+                    )?;
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            Fault::invalid(format!(
+                                "messages[{index}].tool_calls[{call_index}].function.name is required"
+                            ))
+                        })?;
+                    let arguments = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            Fault::invalid(format!(
+                                "messages[{index}].tool_calls[{call_index}].function.arguments must be a JSON string"
+                            ))
+                        })?;
+                    projected_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }));
+                }
+                let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": projected_calls,
+                }));
+                continue;
+            }
+            if ["function_call", "tool_call_id"]
                 .iter()
                 .any(|field| message.contains_key(*field))
             {
-                return Err(Fault::invalid("tool messages are unsupported"));
+                return Err(Fault::invalid(
+                    "legacy function_call messages are unsupported",
+                ));
             }
             let content = message
                 .get("content")
                 .ok_or_else(|| Fault::invalid(format!("messages[{index}].content is required")))?;
             messages.push(json!({
                 "role": role,
-                "content": chat_content(content, index)?,
+                "content": chat_content(content, index, &mut sources, &mut references)?,
             }));
         }
-        let prompt = transcript_prompt(None, &messages)?;
+        let uploads = sources.uploads(&references)?;
+        let prompt = transcript_prompt(None, &messages, &tools, &choice, &tool_nonce)?;
         Ok(Self {
             requested_model,
             stream,
@@ -105,6 +199,10 @@ impl Projection {
             conversation_id,
             native_tools,
             project_uuid,
+            tools,
+            choice,
+            tool_nonce,
+            uploads,
             prompt,
         })
     }
@@ -117,7 +215,8 @@ impl Projection {
             validate_conversation_id(optional_string(object, "conversation_id")?)?;
         let native_tools = object.get("claud2api_tools").cloned();
         let project_uuid = crate::native_tools::project(raw)?;
-        reject_tools(object)?;
+        let (tools, choice) = tool_definitions(object)?;
+        let tool_nonce = nonce();
         if object
             .get("previous_response_id")
             .is_some_and(|value| !value.is_null())
@@ -138,6 +237,8 @@ impl Projection {
         let input = object
             .get("input")
             .ok_or_else(|| Fault::invalid("input is required"))?;
+        let mut sources = crate::media::Sources::default();
+        let mut references = Vec::new();
         let messages = if let Some(text) = input.as_str() {
             vec![json!({"role":"user","content":text})]
         } else {
@@ -152,12 +253,65 @@ impl Projection {
                 let message = raw_message.as_object().ok_or_else(|| {
                     Fault::invalid(format!("input[{index}] must be a message object"))
                 })?;
-                if message
-                    .get("type")
-                    .is_some_and(|kind| kind.as_str() != Some("message"))
-                {
+                let kind = match message.get("type") {
+                    None => "message",
+                    Some(Value::String(kind)) => kind.as_str(),
+                    Some(_) => {
+                        return Err(Fault::invalid(format!(
+                            "input[{index}].type must be a string"
+                        )));
+                    }
+                };
+                if kind == "function_call" {
+                    let call_id = message
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| message.get("id").and_then(Value::as_str))
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            Fault::invalid(format!("input[{index}].call_id is required"))
+                        })?;
+                    let name = message
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            Fault::invalid(format!("input[{index}].name is required"))
+                        })?;
+                    let arguments = message
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}");
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }],
+                    }));
+                    continue;
+                }
+                if kind == "function_call_output" {
+                    let call_id = message
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            Fault::invalid(format!("input[{index}].call_id is required"))
+                        })?;
+                    let output = message.get("output").and_then(Value::as_str).unwrap_or("");
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output,
+                    }));
+                    continue;
+                }
+                if kind != "message" {
                     return Err(Fault::invalid(format!(
-                        "input[{index}] must be a text message"
+                        "input[{index}] must be a text message, function_call, or function_call_output"
                     )));
                 }
                 let role = message
@@ -180,12 +334,19 @@ impl Projection {
                     .ok_or_else(|| Fault::invalid(format!("input[{index}].content is required")))?;
                 messages.push(json!({
                     "role": role,
-                    "content": responses_content(content, index)?,
+                    "content": responses_content(content, index, &mut sources, &mut references)?,
                 }));
             }
             messages
         };
-        let prompt = transcript_prompt(instructions.as_deref(), &messages)?;
+        let uploads = sources.uploads(&references)?;
+        let prompt = transcript_prompt(
+            instructions.as_deref(),
+            &messages,
+            &tools,
+            &choice,
+            &tool_nonce,
+        )?;
         Ok(Self {
             requested_model,
             stream,
@@ -193,6 +354,10 @@ impl Projection {
             conversation_id,
             native_tools,
             project_uuid,
+            tools,
+            choice,
+            tool_nonce,
+            uploads,
             prompt,
         })
     }
@@ -211,16 +376,145 @@ fn model_field(object: &Map<String, Value>) -> Result<String> {
     }
 }
 
-fn reject_tools(object: &Map<String, Value>) -> Result<()> {
-    if ["tools", "tool_choice", "functions", "function_call"]
-        .iter()
-        .any(|field| object.contains_key(*field))
-    {
+fn tool_definitions(
+    object: &Map<String, Value>,
+) -> Result<(Vec<protocol::Tool>, protocol::Choice)> {
+    if object.contains_key("functions") || object.contains_key("function_call") {
         return Err(Fault::invalid(
-            "tool calling is unsupported by this text adapter",
+            "legacy functions/function_call are unsupported; use tools",
         ));
     }
-    Ok(())
+    let mut tools = Vec::new();
+    if let Some(raw) = object.get("tools").filter(|value| !value.is_null()) {
+        let list = raw
+            .as_array()
+            .filter(|list| list.len() <= 128)
+            .ok_or_else(|| Fault::invalid("tools must be an array of at most 128 entries"))?;
+        for item in list {
+            let item = item
+                .as_object()
+                .ok_or_else(|| Fault::invalid("each tool must be an object"))?;
+            if item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "function")
+            {
+                return Err(Fault::invalid("only function tools are supported"));
+            }
+            let function = item
+                .get("function")
+                .and_then(Value::as_object)
+                .unwrap_or(item);
+            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err(Fault::invalid(
+                    "tool names must be 1-128 ASCII letters, digits, underscores, or dashes",
+                ));
+            }
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let schema = function
+                .get("parameters")
+                .or_else(|| function.get("input_schema"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object"}));
+            if !schema.is_object()
+                || schema
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "object")
+            {
+                return Err(Fault::invalid(
+                    "tool parameters must be a JSON object schema",
+                ));
+            }
+            tools.push(protocol::Tool {
+                name: name.to_owned(),
+                description,
+                input_schema: schema,
+            });
+        }
+    }
+    let mut choice = match object.get("tool_choice") {
+        None | Some(Value::Null) => protocol::Choice::default(),
+        Some(Value::String(value)) => match value.as_str() {
+            "auto" => protocol::Choice::default(),
+            "none" => protocol::Choice {
+                mode: "none".to_owned(),
+                name: String::new(),
+                single: false,
+            },
+            "required" => protocol::Choice {
+                mode: "any".to_owned(),
+                name: String::new(),
+                single: false,
+            },
+            _ => {
+                return Err(Fault::invalid(
+                    "tool_choice must be auto, none, or required",
+                ));
+            }
+        },
+        Some(Value::Object(value)) => {
+            if value.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(Fault::invalid("tool_choice must select a function"));
+            }
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    value
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| Fault::invalid("tool_choice.function.name is required"))?;
+            protocol::Choice {
+                mode: "tool".to_owned(),
+                name: name.to_owned(),
+                single: false,
+            }
+        }
+        Some(_) => return Err(Fault::invalid("invalid tool_choice")),
+    };
+    if object.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
+        choice.single = true;
+    }
+    if choice.mode == "tool" && !tools.iter().any(|tool| tool.name == choice.name) {
+        return Err(Fault::invalid("tool_choice references an unknown tool"));
+    }
+    Ok((tools, choice))
+}
+
+fn tool_prompt(tools: &[protocol::Tool], choice: &protocol::Choice, nonce: &str) -> String {
+    let list = serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_owned());
+    let policy = match choice.mode.as_str() {
+        "none" => "Do not call any tool.",
+        "any" => "You must call at least one tool.",
+        "tool" => "You must call the requested tool.",
+        _ => "Call a tool only when needed; otherwise answer the user directly.",
+    };
+    let parallel = if choice.single {
+        "At most one tool call."
+    } else {
+        "Multiple tool calls are allowed."
+    };
+    format!(
+        "Tool protocol: available tools are {list}. To call a tool, output only \
+         <tool_call_{nonce}>{{\"name\":\"<tool name>\",\"input\":<arguments>}}</tool_call_{nonce}> \
+         and stop. The client executes the tool and sends the result in the next turn; never invent results. \
+         {policy} {parallel}"
+    )
 }
 
 fn token_usage(prompt: &str, output: &str) -> Value {
@@ -259,13 +553,18 @@ fn validate_conversation_id(id: Option<String>) -> Result<Option<String>> {
     Ok(id)
 }
 
-fn chat_content(value: &Value, index: usize) -> Result<Value> {
+fn chat_content(
+    value: &Value,
+    index: usize,
+    sources: &mut crate::media::Sources,
+    references: &mut Vec<crate::media::Reference>,
+) -> Result<Value> {
     if let Some(text) = value.as_str() {
         return Ok(Value::String(text.to_owned()));
     }
     let parts = value.as_array().ok_or_else(|| {
         Fault::invalid(format!(
-            "messages[{index}].content must be a string or text array"
+            "messages[{index}].content must be a string or content array"
         ))
     })?;
     let mut projected = Vec::with_capacity(parts.len());
@@ -275,28 +574,58 @@ fn chat_content(value: &Value, index: usize) -> Result<Value> {
                 "messages[{index}].content[{part_index}] must be an object"
             ))
         })?;
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return Err(Fault::invalid(format!(
-                "messages[{index}].content[{part_index}] must be a text part"
-            )));
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    Fault::invalid(format!(
+                        "messages[{index}].content[{part_index}].text must be a string"
+                    ))
+                })?;
+                projected.push(json!({"type":"text","text":text}));
+            }
+            Some("image_url") => {
+                let url = part
+                    .get("image_url")
+                    .and_then(|image| {
+                        image
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .or_else(|| image.as_str())
+                    })
+                    .ok_or_else(|| {
+                        Fault::invalid(format!(
+                            "messages[{index}].content[{part_index}].image_url.url is required"
+                        ))
+                    })?;
+                let reference = sources.data_url(url, None)?;
+                projected.push(json!({
+                    "type": "text",
+                    "text": format!("[image attached: {}]", reference.filename),
+                }));
+                references.push(reference);
+            }
+            _ => {
+                return Err(Fault::invalid(format!(
+                    "messages[{index}].content[{part_index}] must be a text or image_url part"
+                )));
+            }
         }
-        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
-            Fault::invalid(format!(
-                "messages[{index}].content[{part_index}].text must be a string"
-            ))
-        })?;
-        projected.push(json!({"type":"text","text":text}));
     }
     Ok(Value::Array(projected))
 }
 
-fn responses_content(value: &Value, index: usize) -> Result<Value> {
+fn responses_content(
+    value: &Value,
+    index: usize,
+    sources: &mut crate::media::Sources,
+    references: &mut Vec<crate::media::Reference>,
+) -> Result<Value> {
     if let Some(text) = value.as_str() {
         return Ok(Value::String(text.to_owned()));
     }
     let parts = value.as_array().ok_or_else(|| {
         Fault::invalid(format!(
-            "input[{index}].content must be a string or text array"
+            "input[{index}].content must be a string or content array"
         ))
     })?;
     let mut projected = Vec::with_capacity(parts.len());
@@ -306,33 +635,71 @@ fn responses_content(value: &Value, index: usize) -> Result<Value> {
                 "input[{index}].content[{part_index}] must be an object"
             ))
         })?;
-        let kind = part
-            .get("type")
-            .and_then(Value::as_str)
-            .filter(|kind| matches!(*kind, "input_text" | "text" | "output_text"))
-            .ok_or_else(|| {
-                Fault::invalid(format!(
-                    "input[{index}].content[{part_index}] must be a text part"
-                ))
-            })?;
-        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+        let kind = part.get("type").and_then(Value::as_str).ok_or_else(|| {
             Fault::invalid(format!(
-                "input[{index}].content[{part_index}].text must be a string"
+                "input[{index}].content[{part_index}].type is required"
             ))
         })?;
-        projected.push(json!({"type":kind,"text":text}));
+        match kind {
+            "input_text" | "text" | "output_text" => {
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    Fault::invalid(format!(
+                        "input[{index}].content[{part_index}].text must be a string"
+                    ))
+                })?;
+                projected.push(json!({"type":kind,"text":text}));
+            }
+            "input_image" | "image_url" => {
+                let url = part
+                    .get("image_url")
+                    .and_then(|image| {
+                        image
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .or_else(|| image.as_str())
+                    })
+                    .or_else(|| part.get("url").and_then(Value::as_str))
+                    .ok_or_else(|| {
+                        Fault::invalid(format!(
+                            "input[{index}].content[{part_index}].image_url is required"
+                        ))
+                    })?;
+                let reference = sources.data_url(url, None)?;
+                projected.push(json!({
+                    "type": "text",
+                    "text": format!("[image attached: {}]", reference.filename),
+                }));
+                references.push(reference);
+            }
+            _ => {
+                return Err(Fault::invalid(format!(
+                    "input[{index}].content[{part_index}] must be a text or image part"
+                )));
+            }
+        }
     }
     Ok(Value::Array(projected))
 }
 
-fn transcript_prompt(instructions: Option<&str>, messages: &[Value]) -> Result<String> {
+fn transcript_prompt(
+    instructions: Option<&str>,
+    messages: &[Value],
+    tools: &[protocol::Tool],
+    choice: &protocol::Choice,
+    tool_nonce: &str,
+) -> Result<String> {
     let transcript = json!({
         "instructions": instructions,
         "messages": messages,
     });
     let transcript = serde_json::to_string(&transcript)
         .map_err(|_| Fault::invalid("could not encode text transcript"))?;
-    Ok(format!("{BRIDGE}\n{transcript}"))
+    let mut prompt = format!("{BRIDGE}\n{transcript}");
+    if !tools.is_empty() {
+        prompt.push('\n');
+        prompt.push_str(&tool_prompt(tools, choice, tool_nonce));
+    }
+    Ok(prompt)
 }
 
 struct Active {
@@ -353,6 +720,10 @@ struct Active {
     target: String,
     conversation_key: Option<String>,
     tool_descriptors: Value,
+    uploads: Vec<crate::media::Upload>,
+    tool_decoder: Option<protocol::ToolDecoder>,
+    tool_calls: Vec<Value>,
+    pending_pulls: VecDeque<Pull>,
     decoder: WebBlockDecoder,
     emissions: VecDeque<WebEmission>,
     upstream_done: bool,
@@ -368,6 +739,7 @@ struct Active {
 
 enum Pull {
     Text(String),
+    ToolCall(Value),
     Skip,
     NativeStart(Value),
     NativeDelta(Value),
@@ -690,6 +1062,16 @@ async fn begin(
         target,
         conversation_key,
         tool_descriptors,
+        uploads: projection.uploads,
+        tool_decoder: (!projection.tools.is_empty()).then(|| {
+            protocol::ToolDecoder::from_tools(
+                projection.tools.clone(),
+                projection.choice.clone(),
+                &projection.tool_nonce,
+            )
+        }),
+        tool_calls: Vec::new(),
+        pending_pulls: VecDeque::new(),
         decoder: WebBlockDecoder::new(native_allowed_names),
         emissions: VecDeque::new(),
         upstream_done: false,
@@ -749,7 +1131,7 @@ async fn start_completion(active: &mut Active) -> Result<()> {
                 parent: &active.parent,
                 model: &active.model,
                 prompt: &active.prompt,
-                uploads: &[],
+                uploads: &active.uploads,
                 tools: active.tool_descriptors.clone(),
                 thinking: &active.thinking,
             },
@@ -815,10 +1197,23 @@ async fn complete_active(active: &mut Active, text: &str) -> Result<Value> {
 
 async fn pull_text(active: &mut Active, output: &mut String) -> Result<Pull> {
     loop {
+        if let Some(pull) = active.pending_pulls.pop_front() {
+            return Ok(pull);
+        }
         if let Some(emission) = active.emissions.pop_front() {
-            return emission_to_pull(active, output, emission);
+            if let Some(pull) = push_emission(active, output, emission)? {
+                return Ok(pull);
+            }
+            continue;
         }
         if active.upstream_done {
+            if let Some(decoder) = active.tool_decoder.as_mut() {
+                let blocks = decoder.finish()?;
+                push_tool_blocks(active, blocks, output)?;
+            }
+            if let Some(pull) = active.pending_pulls.pop_front() {
+                return Ok(pull);
+            }
             return Ok(Pull::Done);
         }
         let scope = &active.scope;
@@ -839,10 +1234,65 @@ async fn pull_text(active: &mut Active, output: &mut String) -> Result<Pull> {
             active.upstream_done = true;
         }
         active.emissions.extend(emissions);
-        if let Some(emission) = active.emissions.pop_front() {
-            return emission_to_pull(active, output, emission);
+    }
+}
+
+fn push_emission(
+    active: &mut Active,
+    output: &mut String,
+    emission: WebEmission,
+) -> Result<Option<Pull>> {
+    match emission {
+        WebEmission::Text(delta) if active.tool_decoder.is_some() => {
+            let blocks = active
+                .tool_decoder
+                .as_mut()
+                .expect("tool decoder")
+                .feed(&delta)?;
+            push_tool_blocks(active, blocks, output)?;
+            Ok(None)
+        }
+        emission => Ok(Some(emission_to_pull(active, output, emission)?)),
+    }
+}
+
+fn push_tool_blocks(
+    active: &mut Active,
+    blocks: Vec<protocol::Block>,
+    output: &mut String,
+) -> Result<()> {
+    for block in blocks {
+        match block {
+            protocol::Block::Text { text } if !text.is_empty() => {
+                if output
+                    .len()
+                    .saturating_add(active.native_bytes)
+                    .saturating_add(text.len())
+                    > MAX_OUTPUT_BYTES
+                {
+                    return Err(Fault::new(
+                        502,
+                        "api_error",
+                        "upstream output exceeds limit",
+                    ));
+                }
+                output.push_str(&text);
+                active.pending_pulls.push_back(Pull::Text(text));
+            }
+            protocol::Block::Tool { id, name, input } => {
+                let arguments = serde_json::to_string(&input).map_err(|_| Fault::internal())?;
+                let call = json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                });
+                active.tool_calls.push(call.clone());
+                active.pending_pulls.push_back(Pull::ToolCall(call));
+            }
+            _ => {}
         }
     }
+    Ok(())
 }
 
 fn emission_to_pull(
@@ -984,6 +1434,20 @@ fn chat_chunk(active: &Active, delta: Value, finish_reason: Option<&str>) -> Val
 }
 
 fn chat_document(active: &Active, text: &str, usage: &Value) -> Value {
+    let finish = if active.tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+    let content = if text.is_empty() && !active.tool_calls.is_empty() {
+        Value::Null
+    } else {
+        json!(text)
+    };
+    let mut message = json!({"role":"assistant","content":content});
+    if !active.tool_calls.is_empty() {
+        message["tool_calls"] = json!(active.tool_calls);
+    }
     json!({
         "id": active.response_id,
         "object": "chat.completion",
@@ -991,8 +1455,8 @@ fn chat_document(active: &Active, text: &str, usage: &Value) -> Value {
         "model": active.public_model,
         "choices": [{
             "index": 0,
-            "message": {"role":"assistant","content":text},
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": finish,
         }],
         "usage": {
             "prompt_tokens": usage["input_tokens"],
@@ -1048,14 +1512,32 @@ fn response_message(active: &Active, text: &str) -> Value {
     })
 }
 
+fn response_tool_item(call: &Value) -> Value {
+    json!({
+        "id": call["id"],
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call["id"],
+        "name": call["function"]["name"],
+        "arguments": call["function"]["arguments"],
+    })
+}
+
 fn response_document(active: &Active, text: &str, usage: &Value) -> Value {
+    let mut output = Vec::new();
+    if !text.is_empty() || active.tool_calls.is_empty() {
+        output.push(response_message(active, text));
+    }
+    for call in &active.tool_calls {
+        output.push(response_tool_item(call));
+    }
     json!({
         "id": active.response_id,
         "object": "response",
         "created_at": active.created,
         "status": "completed",
         "model": active.public_model,
-        "output": [response_message(active, text)],
+        "output": output,
         "usage": usage,
         "claud2api_native": active.native_blocks,
         "claud2api_citations": active.citations,
@@ -1149,6 +1631,16 @@ fn chat_stream(mut active: Active, include_usage: bool) -> Response {
                     let chunk = chat_chunk(&active, json!({"content":delta}), None);
                     yield Ok(sse_data(&chunk));
                 }
+                Ok(Pull::ToolCall(call)) => {
+                    let index = active.tool_calls.len() - 1;
+                    let chunk = chat_chunk(&active, json!({"tool_calls":[{
+                        "index": index,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": call["function"],
+                    }]}), None);
+                    yield Ok(sse_data(&chunk));
+                }
                 Ok(Pull::NativeStart(block)) => {
                     yield Ok(chat_extension(&active, "claud2api.native_start", "block", block));
                 }
@@ -1164,7 +1656,12 @@ fn chat_stream(mut active: Active, include_usage: bool) -> Response {
                 Ok(Pull::Done) => {
                     match complete_active(&mut active, &output).await {
                         Ok(usage) => {
-                            let finish = chat_chunk(&active, json!({}), Some("stop"));
+                            let finish_reason = if active.tool_calls.is_empty() {
+                                "stop"
+                            } else {
+                                "tool_calls"
+                            };
+                            let finish = chat_chunk(&active, json!({}), Some(finish_reason));
                             yield Ok(sse_data(&finish));
                             if include_usage {
                                 let usage_chunk = json!({
@@ -1279,6 +1776,21 @@ fn response_stream(mut active: Active) -> Response {
                         "delta": delta,
                     }));
                     yield Ok(sse_event("response.output_text.delta", &event));
+                    sequence += 1;
+                }
+                Ok(Pull::ToolCall(call)) => {
+                    let output_index = active.tool_calls.len();
+                    let added = response_event("response.output_item.added", sequence, json!({
+                        "output_index": output_index,
+                        "item": response_tool_item(&call),
+                    }));
+                    yield Ok(sse_event("response.output_item.added", &added));
+                    sequence += 1;
+                    let done = response_event("response.output_item.done", sequence, json!({
+                        "output_index": output_index,
+                        "item": response_tool_item(&call),
+                    }));
+                    yield Ok(sse_event("response.output_item.done", &done));
                     sequence += 1;
                 }
                 Ok(Pull::NativeStart(block)) => {
@@ -1419,6 +1931,7 @@ async fn run_nonstream(mut active: Active) -> Result<Response> {
                 | Pull::Text(_)
                 | Pull::NativeStart(_)
                 | Pull::NativeDelta(_)
+                | Pull::ToolCall(_)
                 | Pull::NativeStop(_)
                 | Pull::Citation(_),
             ) => {}
@@ -1629,11 +2142,12 @@ mod tests {
             "tools":[],
             "messages":[{"role":"user","content":"run"}]
         });
-        assert_eq!(Projection::chat(&client_function).unwrap_err().status, 400);
+        let projection = Projection::chat(&client_function).expect("client tools are independent");
+        assert!(projection.tools.is_empty());
     }
 
     #[test]
-    fn text_projection_rejects_images_tools_and_wrong_field_types() {
+    fn text_projection_accepts_images_and_tools_but_rejects_malformed_fields() {
         let image = json!({
             "model":"claude-test",
             "messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]
@@ -1645,7 +2159,15 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f"}}],
             "messages":[{"role":"user","content":"run"}]
         });
-        assert_eq!(Projection::chat(&tool).unwrap_err().status, 400);
+        let projection = Projection::chat(&tool).expect("function tools are accepted");
+        assert_eq!(projection.tools[0].name, "f");
+
+        let invalid_tool = json!({
+            "model":"claude-test",
+            "tools":[{"type":"function","function":{"name":"bad name"}}],
+            "messages":[{"role":"user","content":"run"}]
+        });
+        assert_eq!(Projection::chat(&invalid_tool).unwrap_err().status, 400);
 
         let malformed = json!({
             "model":"claude-test",

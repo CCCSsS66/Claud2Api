@@ -7,6 +7,7 @@ license = "MIT"
 description = "A small stateful protocol gateway with a private control room"
 
 [dependencies]
+tower = { version = "0.5", features = ["util"] }
 axum = { version = "=0.8.9", features = ["json", "http1", "tokio"] }
 axum-server = { version = "=0.8.0", features = ["tls-rustls"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
@@ -42,7 +43,6 @@ btls = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf37
 btls-sys = { git = "https://github.com/0x676e67/btls", rev = "129887582a538b8f4dcf371d15c953335312ca37" }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 

@@ -968,16 +968,19 @@ pub struct ToolDecoder {
     tools: Vec<Tool>,
 }
 impl ToolDecoder {
-    pub fn new(input: &Input, nonce: &str) -> Self {
+    pub fn from_tools(tools: Vec<Tool>, choice: Choice, nonce: &str) -> Self {
         Self {
             open: format!("<tool_call_{nonce}>"),
             close: format!("</tool_call_{nonce}>"),
             buffer: String::new(),
             inside: false,
             calls: 0,
-            choice: input.choice.clone(),
-            tools: input.tools.clone(),
+            choice,
+            tools,
         }
+    }
+    pub fn new(input: &Input, nonce: &str) -> Self {
+        Self::from_tools(input.tools.clone(), input.choice.clone(), nonce)
     }
     pub fn feed(&mut self, text: &str) -> Result<Vec<Block>> {
         self.buffer.push_str(text);

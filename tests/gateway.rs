@@ -261,6 +261,7 @@ enum Reply {
     Slow,
     Summary(String),
     ClientTool { input: Value, final_text: String },
+    TaggedTool { name: String, input: Value },
     Raw(String),
 }
 impl Drop for Fixture {
@@ -524,6 +525,18 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
                 event(json!({"type":"content_block_delta","delta":{"text":"partial"}}))
             }
             Reply::Text(text) | Reply::Summary(text) => text_events(&text),
+            Reply::TaggedTool { name, input } => {
+                let prompt = json_body["prompt"].as_str().unwrap_or("");
+                let nonce = prompt
+                    .split("<tool_call_")
+                    .nth(1)
+                    .and_then(|rest| rest.split('>').next())
+                    .unwrap_or("fixture");
+                text_events(&format!(
+                    "<tool_call_{nonce}>{}</tool_call_{nonce}>",
+                    json!({"name": name, "input": input})
+                ))
+            }
             Reply::Raw(text) => text,
             Reply::ClientTool { input, final_text } => {
                 let wire_name = json_body["tools"]
@@ -3529,11 +3542,11 @@ async fn text_adapters_reject_unsupported_inputs_without_contacting_upstream() {
         ),
         (
             "/v1/chat/completions",
-            json!({"model":"test","tools":[{"type":"function","function":{"name":"read"}}],"messages":[{"role":"user","content":"hello"}]}),
+            json!({"model":"test","tools":[{"type":"function","function":{"name":"bad name"}}],"messages":[{"role":"user","content":"hello"}]}),
         ),
         (
             "/v1/responses",
-            json!({"model":"test","input":[{"type":"function_call","name":"read","arguments":"{}"}]}),
+            json!({"model":"test","input":[{"type":"function_call","arguments":"{}"}]}),
         ),
         (
             "/v1/responses",
@@ -8309,4 +8322,222 @@ async fn probe_records_account_email_and_organization() {
     let state = f.engine.store.read().await;
     assert_eq!(state.accounts[&id].email, "fixture@example.com");
     assert!(!state.accounts[&id].org_uuid.is_empty());
+}
+
+#[tokio::test]
+async fn openai_chat_supports_function_calling_and_tool_results() {
+    let f = fixture(1).await;
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        }
+    }]);
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::TaggedTool {
+            name: "Read".to_owned(),
+            input: json!({"path": "a.txt"}),
+        });
+    let request = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "read the file"}],
+        "tools": tools,
+        "tool_choice": "auto"
+    });
+    let (status, _, body) = call(&f.engine, "/v1/chat/completions", request, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+    let call_value = &body["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call_value["type"], "function");
+    assert_eq!(call_value["function"]["name"], "Read");
+    assert_eq!(call_value["function"]["arguments"], "{\"path\":\"a.txt\"}");
+    let call_id = call_value["id"].as_str().unwrap().to_owned();
+    assert!(!call_id.is_empty());
+
+    // The next turn sends the assistant call and its result back.
+    reset_pacing(&f.engine).await;
+    let follow_up = json!({
+        "model": "test",
+        "messages": [
+            {"role": "user", "content": "read the file"},
+            {"role": "assistant", "content": null, "tool_calls": [call_value]},
+            {"role": "tool", "tool_call_id": call_id, "content": "file contents: hello"}
+        ],
+        "tools": tools
+    });
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Text("the file says hello".to_owned()));
+    let (status, _, body) = call(&f.engine, "/v1/chat/completions", follow_up, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "the file says hello"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    let prompt = calls[1]["body"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("file contents: hello"), "{prompt}");
+    assert!(prompt.contains("\"tool_calls\""), "{prompt}");
+}
+
+#[tokio::test]
+async fn openai_responses_supports_function_calling() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::TaggedTool {
+            name: "Read".to_owned(),
+            input: json!({"path": "b.txt"}),
+        });
+    let request = json!({
+        "model": "test",
+        "input": "read the file",
+        "tools": [{
+            "type": "function",
+            "name": "Read",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+        }]
+    });
+    let (status, _, body) = call(&f.engine, "/v1/responses", request, None).await;
+    assert_eq!(status, 200, "{body}");
+    let item = &body["output"][0];
+    assert_eq!(item["type"], "function_call");
+    assert_eq!(item["name"], "Read");
+    assert_eq!(item["arguments"], "{\"path\":\"b.txt\"}");
+    assert_eq!(body["status"], "completed");
+}
+
+#[tokio::test]
+async fn openai_streams_function_calls() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::TaggedTool {
+            name: "Read".to_owned(),
+            input: json!({"path": "c.txt"}),
+        });
+    let request = json!({
+        "model": "test",
+        "stream": true,
+        "messages": [{"role": "user", "content": "read"}],
+        "tools": [{"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}}]
+    });
+    let (status, _, body) = call(&f.engine, "/v1/chat/completions", request, None).await;
+    assert_eq!(status, 200);
+    let text = body.as_str().unwrap();
+    assert!(text.contains("\"tool_calls\""), "{text}");
+    assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
+
+    reset_pacing(&f.engine).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::TaggedTool {
+            name: "Read".to_owned(),
+            input: json!({"path": "d.txt"}),
+        });
+    let request = json!({
+        "model": "test",
+        "stream": true,
+        "input": "read",
+        "tools": [{"type": "function", "name": "Read", "parameters": {"type": "object"}}]
+    });
+    let (status, _, body) = call(&f.engine, "/v1/responses", request, None).await;
+    assert_eq!(status, 200);
+    let text = body.as_str().unwrap();
+    assert!(text.contains("response.output_item.added"), "{text}");
+    assert!(text.contains("function_call"), "{text}");
+    assert!(text.contains("response.completed"), "{text}");
+}
+
+#[tokio::test]
+async fn openai_responses_accepts_embedded_images() {
+    let f = fixture(1).await;
+    let url = format!("data:image/png;base64,{MEDIA_PNG}");
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Text("seen too".to_owned()));
+    let request = json!({
+        "model": "test",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "describe this"},
+            {"type": "input_image", "image_url": url}
+        ]}]
+    });
+    let (status, _, body) = call(&f.engine, "/v1/responses", request, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(f.upstream.uploaded.lock().await.len(), 1);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    let prompt = calls[0]["body"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("[image attached: "), "{prompt}");
+}
+
+#[tokio::test]
+async fn openai_accepts_embedded_images() {
+    let f = fixture(1).await;
+    let url = format!("data:image/png;base64,{MEDIA_PNG}");
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Text("seen".to_owned()));
+    let request = json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": url}}
+        ]}]
+    });
+    let (status, _, body) = call(&f.engine, "/v1/chat/completions", request, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "seen");
+    assert_eq!(f.upstream.uploaded.lock().await.len(), 1);
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls[0]["body"]["files"].as_array().unwrap().len(), 1);
+    let prompt = calls[0]["body"]["prompt"].as_str().unwrap();
+    assert!(prompt.contains("[image attached: "), "{prompt}");
+    assert!(prompt.contains(".png]"), "{prompt}");
+}
+
+#[tokio::test]
+async fn playground_forwards_to_the_public_messages_pipeline() {
+    let f = fixture(1).await;
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Text("playground answer".to_owned()));
+    let (status, body) = admin(
+        &f.engine,
+        "POST",
+        "/playground",
+        json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["content"][0]["text"], "playground answer");
+    assert_eq!(f.upstream.created.load(Ordering::SeqCst), 1);
 }

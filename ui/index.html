@@ -61,6 +61,10 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 2a7 7 0 1 1 0 14 7 7 0 0 1 0-14Zm-1 2v6l5 2 .8-1.6-3.8-1.6V7h-2Z"/></svg>
           <span class="nav-label">操作记录</span>
         </button>
+        <button data-tab="playground" title="在线测试">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-7l-4 4v-4H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm2 4v2h10V8H7Zm0 4v2h7v-2H7Z"/></svg>
+          <span class="nav-label">在线测试</span>
+        </button>
       </nav>
       <div class="sidebar-bottom">
         <button id="logout" class="quiet" hidden>退出登录</button>
@@ -434,6 +438,35 @@
               </div>
             </div>
             <div class="panel"><div id="event-table" class="table-wrap"></div></div>
+          </section>
+          <section id="playground" class="tab" hidden>
+            <div class="page-head">
+              <div>
+                <div class="section-label">PLAYGROUND</div>
+                <h1>在线测试</h1>
+                <p>通过网关直接与上游对话，验证模型、思考与流式输出；不会消耗 API 令牌。</p>
+              </div>
+            </div>
+            <div class="panel playground-panel">
+              <div class="playground-controls">
+                <label>模型
+                  <input id="playground-model" list="playground-models" value="claude-haiku-5-5" autocomplete="off">
+                  <datalist id="playground-models"></datalist>
+                </label>
+                <label class="playground-stream"><input type="checkbox" id="playground-stream" checked> 流式输出</label>
+              </div>
+              <label>System Prompt
+                <textarea id="playground-system" rows="2" placeholder="可选"></textarea>
+              </label>
+              <label>消息
+                <textarea id="playground-input" rows="4" placeholder="输入要发送的内容"></textarea>
+              </label>
+              <div class="playground-actions">
+                <button id="playground-send" type="button">发送</button>
+                <button id="playground-clear" class="quiet" type="button">清空对话</button>
+              </div>
+              <pre id="playground-output" class="playground-output" aria-live="polite"></pre>
+            </div>
           </section>
         </div>
       </main>

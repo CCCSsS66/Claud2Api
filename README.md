@@ -67,6 +67,8 @@ Claud2Api 是一个用 Rust 编写的 Claude 网页端 → Anthropic Messages AP
 - `/v1/models` 同时列出每个模型的基础版本与 `-thinking` 版本
 - `GET /v1/models`：同时兼容 Anthropic 与 OpenAI 模型对象
 - 兼容接口：`POST /v1/chat/completions`、`POST /v1/responses`、`DELETE /v1/conversations/{id}`
+- OpenAI Function Calling：`tools` / `tool_choice` / `parallel_tool_calls`，流式与非流式，工具结果按 `tool` 消息或 `function_call_output` 回传
+- OpenAI 图片输入：Chat `image_url` 与 Responses `input_image`，支持内嵌 base64 data URL（不抓取远程 URL）
 - 自定义模型映射、`c2a-` 桥接模型名、粘性会话、上下文压缩、模拟 1h 缓存统计
 
 ### 账号池
@@ -79,6 +81,7 @@ Claud2Api 是一个用 Rust 编写的 Claude 网页端 → Anthropic Messages AP
 ### 管理控制台
 
 - 账号、模型映射、API 令牌、粘性会话、运行配置、消息日志、操作审计、用量概览
+- 在线测试页：选择模型、System Prompt、多轮对话、流式输出，直接复用网关调度
 - 管理员会话（默认 8 小时、退出即撤销）、登录失败锁定、来源网段白名单
 - 深色 / 浅色主题，桌面与移动端适配，版本管理与回退
 
