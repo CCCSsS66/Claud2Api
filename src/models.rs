@@ -23,6 +23,7 @@ pub struct ModelEntry {
 pub struct Selection {
     pub upstream: String,
     pub public: String,
+    pub thinking: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UpstreamCatalog {
@@ -86,11 +87,21 @@ impl ModelConfig {
         Ok(())
     }
     pub fn resolve(&self, requested: &str, fallback: &str) -> Result<Selection> {
+        let (requested, thinking) = match requested.strip_suffix("-thinking") {
+            Some(base) => (base, true),
+            None => (requested, false),
+        };
+        let fallback = fallback.strip_suffix("-thinking").unwrap_or(fallback);
         let id = protocol::resolve_model(requested, fallback)?;
         if !self.enabled {
             return Ok(Selection {
                 upstream: id.clone(),
-                public: id,
+                public: if thinking {
+                    format!("{id}-thinking")
+                } else {
+                    id
+                },
+                thinking,
             });
         }
         let original = if requested.is_empty() {
@@ -111,7 +122,12 @@ impl ModelConfig {
             })?;
         Ok(Selection {
             upstream: entry.upstream_model.clone(),
-            public: entry.id.clone(),
+            public: if thinking {
+                format!("{}-thinking", entry.id)
+            } else {
+                entry.id.clone()
+            },
+            thinking,
         })
     }
     pub fn catalog(&self, actual: &[String]) -> Value {
@@ -124,9 +140,25 @@ impl ModelConfig {
         } else {
             actual.iter().map(|id| model_row(id, id)).collect()
         };
-        let first = rows.first().map(|v| v["id"].clone());
-        let last = rows.last().map(|v| v["id"].clone());
-        json!({"object":"list","data":rows,"has_more":false,"first_id":first,"last_id":last})
+        let mut expanded = Vec::with_capacity(rows.len() * 2);
+        for row in rows {
+            let id = row["id"].as_str().unwrap_or("").to_owned();
+            if !id.is_empty() && !id.ends_with("-thinking") {
+                let mut thinking = row.clone();
+                thinking["id"] = json!(format!("{id}-thinking"));
+                thinking["display_name"] = json!(format!(
+                    "{} (thinking)",
+                    row["display_name"].as_str().unwrap_or(&id)
+                ));
+                expanded.push(row.clone());
+                expanded.push(thinking);
+            } else {
+                expanded.push(row);
+            }
+        }
+        let first = expanded.first().map(|v| v["id"].clone());
+        let last = expanded.last().map(|v| v["id"].clone());
+        json!({"object":"list","data":expanded,"has_more":false,"first_id":first,"last_id":last})
     }
 }
 // The web catalog has no real creation timestamps. Emit a stable epoch so the

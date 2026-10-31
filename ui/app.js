@@ -688,6 +688,7 @@ function renderLogs(data, append = false) {
       "操作",
       "状态码",
       "耗时",
+      "首字 / TPS",
       "数据 / 分块",
       "请求 ID",
     ],
@@ -721,6 +722,16 @@ function renderLogs(data, append = false) {
         operation,
         record.status || "—",
         number(record.elapsed_ms) + " ms",
+        (() => {
+          const ttfb = record.first_byte_ms;
+          if (!Number.isFinite(ttfb)) return "—";
+          const output = record.usage?.output_tokens;
+          const window = Math.max(1, (record.elapsed_ms || 0) - ttfb);
+          const tps = Number.isFinite(output)
+            ? ((output * 1000) / window).toFixed(1) + " tok/s"
+            : "—";
+          return number(ttfb) + " ms · " + tps;
+        })(),
         number(record.bytes) + " B / " + number(record.chunks),
         id,
       ];

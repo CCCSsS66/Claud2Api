@@ -618,7 +618,7 @@ async fn accounts(State(e): State<Arc<Engine>>) -> Result<Json<Value>> {
     let mut out = Vec::new();
     for a in state.accounts.values() {
         let busy = e.pool.busy(&a.id).await;
-        out.push(json!({"id":a.id,"label":a.label,"enabled":a.enabled,"paused":a.paused,"cooldown_until":a.cooldown_until,"ready_at":available(a,&state.settings),"busy":busy,"sessions":state.sessions.values().filter(|s|s.account_id==a.id).count(),"browser_profile":a.transport.browser_profile.unwrap_or(e.config.browser_profile).id(),"transport_revision":a.transport_revision,"proxy":a.transport.public_proxy(),"pause_reason":a.pause_reason,"last_probe_at":a.last_probe_at,"last_probe_ok":a.last_probe_ok,"last_probe_error":a.last_probe_error,"proxy_shared":a.transport.proxy_url.as_deref().and_then(|proxy|proxies.get(proxy)).copied().unwrap_or(0),"usage_cycles":cycles.get(&a.id)}));
+        out.push(json!({"id":a.id,"label":a.label,"enabled":a.enabled,"paused":a.paused,"cooldown_until":a.cooldown_until,"ready_at":available(a,&state.settings),"busy":busy,"sessions":state.sessions.values().filter(|s|s.account_id==a.id).count(),"browser_profile":a.transport.browser_profile.unwrap_or(e.config.browser_profile).id(),"transport_revision":a.transport_revision,"proxy":a.transport.public_proxy(),"email":a.email,"org_uuid":a.org_uuid,"pause_reason":a.pause_reason,"last_probe_at":a.last_probe_at,"last_probe_ok":a.last_probe_ok,"last_probe_error":a.last_probe_error,"proxy_shared":a.transport.proxy_url.as_deref().and_then(|proxy|proxies.get(proxy)).copied().unwrap_or(0),"usage_cycles":cycles.get(&a.id)}));
     }
     Ok(Json(
         json!({"schema_version":1,"revision":state.revision,"accounts":out}),
@@ -923,6 +923,7 @@ async fn probe_one(e: &Arc<Engine>, id: &str) -> Value {
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
         Ok(models) => {
+            let info = lease.slot.client.account_info(&lease, &scope).await.ok();
             let _ = e
                 .store
                 .mutate(
@@ -935,6 +936,14 @@ async fn probe_one(e: &Arc<Engine>, id: &str) -> Value {
                         account.last_probe_at = now();
                         account.last_probe_ok = true;
                         account.last_probe_error.clear();
+                        if let Some((email, org)) = &info {
+                            if !email.is_empty() {
+                                account.email = email.clone();
+                            }
+                            if !org.is_empty() {
+                                account.org_uuid = org.clone();
+                            }
+                        }
                         Ok(())
                     },
                 )
@@ -944,6 +953,8 @@ async fn probe_one(e: &Arc<Engine>, id: &str) -> Value {
                 "account_id": id,
                 "status": "ok",
                 "models": models,
+                "email": info.as_ref().map(|v| v.0.clone()).unwrap_or_default(),
+                "org_uuid": info.as_ref().map(|v| v.1.clone()).unwrap_or_default(),
                 "latency_ms": latency_ms,
                 "checked_at": now(),
             })

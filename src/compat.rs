@@ -549,6 +549,7 @@ async fn begin(
         .await
         .models
         .resolve(&projection.requested_model, &engine.config.default_model)?;
+    let selected_thinking = selected.thinking;
     let public_model = selected.public;
     let model = selected.upstream;
     let settings = engine.store.read().await.settings;
@@ -666,7 +667,11 @@ async fn begin(
         Protocol::Responses => format!("resp_{}", nonce()),
     };
     let item_id = format!("msg_{}", nonce());
-    let thinking = engine.config.legacy_thinking.clone();
+    let thinking = if selected_thinking {
+        "auto".to_owned()
+    } else {
+        engine.config.legacy_thinking.clone()
+    };
     let active = Active {
         engine,
         trace,

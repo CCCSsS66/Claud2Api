@@ -66,6 +66,10 @@ pub struct Account {
     pub last_probe_ok: bool,
     #[serde(default)]
     pub last_probe_error: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub org_uuid: String,
 }
 impl Account {
     pub fn new(c: Credential, index: usize) -> Self {
@@ -85,6 +89,8 @@ impl Account {
             last_probe_at: 0,
             last_probe_ok: false,
             last_probe_error: String::new(),
+            email: String::new(),
+            org_uuid: String::new(),
         }
     }
 }

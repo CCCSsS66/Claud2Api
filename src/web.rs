@@ -225,6 +225,7 @@ async fn messages(
             .models
             .resolve(raw["model"].as_str().unwrap_or(""), "")?
     };
+    input.thinking |= selected.thinking;
     input.model = selected.upstream;
     let stream = input.stream;
     let model = selected.public;

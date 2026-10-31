@@ -63,7 +63,8 @@ Claud2Api 是一个用 Rust 编写的 Claude 网页端 → Anthropic Messages AP
 - 图片（PNG/JPEG/GIF/WebP）、PDF、UTF-8 文本附件
 - 客户端工具通道（`tool_use` / `tool_result`），支持强制工具选择与并行限制
 - 网页原生工具组：`web_search`、`artifacts`、`repl`、`widgets`、`project_knowledge`
-- 可选扩展思考（`thinking`）：返回标准思考块与上游签名
+- 可选扩展思考（`thinking`）：返回标准思考块与上游签名；模型名加 `-thinking` 后缀可直接启用
+- `/v1/models` 同时列出每个模型的基础版本与 `-thinking` 版本
 - `GET /v1/models`：同时兼容 Anthropic 与 OpenAI 模型对象
 - 兼容接口：`POST /v1/chat/completions`、`POST /v1/responses`、`DELETE /v1/conversations/{id}`
 - 自定义模型映射、`c2a-` 桥接模型名、粘性会话、上下文压缩、模拟 1h 缓存统计
@@ -73,7 +74,7 @@ Claud2Api 是一个用 Rust 编写的 Claude 网页端 → Anthropic Messages AP
 - 每账号严格串行，最小请求间隔 + 每分钟上限 + 确定性抖动
 - 独立浏览器配置（Chrome / Firefox）与代理（HTTP / HTTPS / SOCKS5 / SOCKS5h）
 - 5 小时本轮/上轮用量、暂停 / 冷却 / 配额状态、共享代理提示
-- 账号存活检测（单个 / 全部）、状态重置、凭据轮换、删除
+- 账号存活检测（单个 / 全部，返回可用模型、邮箱与组织）、状态重置、凭据轮换、删除
 
 ### 管理控制台
 
@@ -138,7 +139,7 @@ curl http://127.0.0.1:18081/health
 - **令牌管理**：创建、编辑、删除 API 令牌；完整令牌只显示一次
 - **粘性会话**：查看与清理空闲会话
 - **运行配置**：会话、请求、调度参数与网页原生工具组开关
-- **消息日志**：输入/输出 Token、模拟缓存、状态码、耗时与请求 ID
+- **消息日志**：输入/输出 Token、模拟缓存、状态码、耗时、首字延迟、TPS 与请求 ID
 - **操作记录**：账号、配置、会话与登录审计
 - **运行概览**：按令牌的用量趋势、占比与模拟费用
 

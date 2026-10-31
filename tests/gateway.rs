@@ -371,6 +371,13 @@ async fn mock(State(state): State<Arc<Upstream>>, request: Request) -> Response 
         return axum::Json(json!([{"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}]))
             .into_response();
     }
+    if path == "/api/account" {
+        return axum::Json(json!({
+            "email_address": "fixture@example.com",
+            "memberships": [{"organization": {"uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}]
+        }))
+        .into_response();
+    }
     if path.starts_with("/edge-api/") {
         let status = state.catalog_status.load(Ordering::SeqCst);
         if status > 0 {
@@ -6594,8 +6601,9 @@ async fn model_configuration_controls_catalog_and_all_six_response_presentations
     assert_eq!(response.status(), 200);
     let list: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(list["data"].as_array().unwrap().len(), 2);
+    assert_eq!(list["data"].as_array().unwrap().len(), 4);
     assert_eq!(list["data"][0]["id"], "work");
+    assert_eq!(list["data"][1]["id"], "work-thinking");
     assert_eq!(list["data"][0]["display_name"], "工作模型");
     for path in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
         for stream in [false, true] {
@@ -7503,15 +7511,23 @@ async fn complete_dynamic_catalog_supports_native_and_bridge_names_without_famil
     assert_eq!(response.status(), 200);
     let list: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(
-        list["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v["id"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>(),
-        ids
-    );
+    let listed: Vec<String> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_owned())
+        .collect();
+    let bases: Vec<String> = listed
+        .iter()
+        .filter(|id| !id.ends_with("-thinking"))
+        .cloned()
+        .collect();
+    assert_eq!(bases, ids);
+    assert_eq!(listed.len(), ids.len() * 2);
+    assert!(listed.iter().all(|id| {
+        ids.iter()
+            .any(|base| id == base || id == &format!("{base}-thinking"))
+    }));
     reset_pacing(&f.engine).await;
     let (status, observed) = admin(&f.engine, "POST", "/models/upstream", json!({}), None).await;
     assert_eq!(status, 200, "{observed}");
@@ -8233,4 +8249,64 @@ async fn account_rotation_requires_clearing_sessions() {
             .unwrap()
             .contains("local sessions")
     );
+}
+
+#[tokio::test]
+async fn thinking_model_suffix_enables_thinking_mode() {
+    let f = fixture(1).await;
+    let mut request = base();
+    request["model"] = json!("test-thinking");
+    f.upstream
+        .replies
+        .lock()
+        .await
+        .push_back(Reply::Text("ok".to_owned()));
+    let (status, _, body) = call(&f.engine, "/v1/messages", request, Some("thinking-suffix")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "test-thinking");
+    let traces = f.upstream.traces.lock().await;
+    let calls = completion_requests(&traces);
+    assert_eq!(calls[0]["body"]["thinking_mode"], "auto");
+}
+
+#[tokio::test]
+async fn model_catalog_lists_thinking_variants() {
+    let f = fixture(1).await;
+    let response = public_raw(
+        &f.engine,
+        "GET",
+        "/v1/models",
+        &f.engine.config.gateway_key,
+        Value::Null,
+    )
+    .await;
+    let list: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let ids: Vec<_> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"test"), "{ids:?}");
+    assert!(ids.contains(&"test-thinking"), "{ids:?}");
+}
+
+#[tokio::test]
+async fn probe_records_account_email_and_organization() {
+    let f = fixture(1).await;
+    let (id, _) = first_account(&f.engine).await;
+    let (status, body) = admin(
+        &f.engine,
+        "POST",
+        &format!("/accounts/{id}/probe"),
+        Value::Null,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["email"], "fixture@example.com");
+    let state = f.engine.store.read().await;
+    assert_eq!(state.accounts[&id].email, "fixture@example.com");
+    assert!(!state.accounts[&id].org_uuid.is_empty());
 }

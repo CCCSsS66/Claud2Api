@@ -593,6 +593,23 @@ impl WebClient {
         *cache = (now() + 300, ids.clone());
         Ok(ids)
     }
+    pub async fn account_info(&self, lease: &Lease, scope: &Scope) -> Result<(String, String)> {
+        let response = self
+            .request(lease, scope, Method::GET, "/api/account", "/new", None)
+            .await?;
+        let data = Self::decode(response, scope).await?;
+        let email = data["email_address"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let org = data
+            .pointer("/memberships/0/organization/uuid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        Ok((email, org))
+    }
     async fn upload_file(
         &self,
         lease: &Lease,
