@@ -499,21 +499,27 @@ fn tool_definitions(
 fn tool_prompt(tools: &[protocol::Tool], choice: &protocol::Choice, nonce: &str) -> String {
     let list = serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_owned());
     let policy = match choice.mode.as_str() {
-        "none" => "Do not call any tool.",
-        "any" => "You must call at least one tool.",
-        "tool" => "You must call the requested tool.",
-        _ => "Call a tool only when needed; otherwise answer the user directly.",
+        "none" => "You must not call a tool; answer in text.",
+        "any" => "You MUST call a tool now; do not answer in text.",
+        "tool" => "You MUST call the requested tool now; do not answer in text.",
+        _ => "Call a tool when it is needed; otherwise answer in text.",
     };
     let parallel = if choice.single {
-        "At most one tool call."
+        "Use exactly one tool call."
     } else {
-        "Multiple tool calls are allowed."
+        "Multiple tool calls are allowed in one block."
     };
+    let example = tools
+        .first()
+        .map(|tool| {
+            format!(
+                "<tool_call_{nonce}>{{\"name\":\"{}\",\"input\":{{}}}}</tool_call_{nonce}>",
+                tool.name
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "Tool protocol: available tools are {list}. To call a tool, output only \
-         <tool_call_{nonce}>{{\"name\":\"<tool name>\",\"input\":<arguments>}}</tool_call_{nonce}> \
-         and stop. The client executes the tool and sends the result in the next turn; never invent results. \
-         {policy} {parallel}"
+        "Tool protocol (this overrides the transcript reply format):\n         Available tools (name, description, JSON input schema): {list}\n         To call a tool, output exactly one block and nothing else:\n         <tool_call_{nonce}>{{\"name\":\"ToolName\",\"input\":{{...}}}}</tool_call_{nonce}>\n         Example: {example}\n         Do not use markdown, code fences, quotes, or any text outside the block.\n         The client executes the tool and sends the result in the next turn; never invent results or tool output.\n         {policy} {parallel}"
     )
 }
 
