@@ -200,7 +200,3 @@ Claud2Api 是独立项目，非 Anthropic 官方产品，与 Claude / Anthropic 
 ## 许可证
 
 [MIT](LICENSE)。上游版权归 Saito-Sakuya 及贡献者所有，本仓库保留原始许可与版权声明。第三方组件许可见 `LICENSES/` 目录。
-
----
-
-> 本仓库是 fork。请勿点击 GitHub 的 **Sync fork / Discard commits**，该操作会把代码重置回上游旧版本。
